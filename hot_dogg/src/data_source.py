@@ -1,18 +1,15 @@
-import logging
-from typing import Optional
-import pandas as pd
-import sys
-import json
-from datetime import datetime, timedelta
 import asyncio
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timedelta
+from typing import Optional
+
+import pandas as pd
 import websockets
 
-from config.settings import (
-    DERIV_APP_ID,
-    DERIV_API_TOKEN,
-    MARKET_SYMBOL,
-    TIMEFRAME_SECONDS,
-)
+from config.settings import DERIV_ACCOUNT_MODE, DERIV_APP_ID, DERIV_API_TOKEN, MARKET_SYMBOL, TIMEFRAME_SECONDS
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +33,12 @@ class DerivDataSource:
         self.cached_data = {}
         self.cache_ttl = timedelta(minutes=5)  # 5-minute TTL for cache
         self.current_price = 0  # Initialize current price
+        self.account_mode = os.getenv("DERIV_ACCOUNT_MODE", DERIV_ACCOUNT_MODE)
+        self.login_id: Optional[str] = None
+        self.landing_company: Optional[str] = None
+        self.is_virtual: Optional[bool] = None
+        self._authorization_logged = False
+
     async def _send_ws_request(self, request_data, retries: int = 3, retry_delay: float = 0.5):
         """Send a request to the Deriv API using WebSockets"""
         attempt = 0
@@ -51,6 +54,7 @@ class DerivDataSource:
                         if "error" in auth_data:
                             self.logger.error(f"Authorization failed: {auth_data['error']['message']}")
                             return None
+                        self._record_authorization(auth_data)
 
                     await websocket.send(json.dumps(request_data))
                     response = await websocket.recv()
@@ -61,6 +65,23 @@ class DerivDataSource:
                 if attempt >= retries:
                     return None
                 await asyncio.sleep(retry_delay * attempt)
+    def _record_authorization(self, auth_data: dict) -> None:
+        if self._authorization_logged:
+            return
+        authorize = auth_data.get("authorize")
+        if not authorize:
+            return
+        self.login_id = authorize.get("loginid")
+        self.landing_company = authorize.get("landing_company_name")
+        self.is_virtual = bool(authorize.get("is_virtual"))
+        account_type = "demo" if self.is_virtual else "real"
+        self.logger.info(
+            "Authorized data feed for Deriv account %s (%s, landing_company=%s)",
+            self.login_id or "unknown",
+            account_type,
+            self.landing_company or "unknown",
+        )
+        self._authorization_logged = True
     async def get_candles(self, symbol: str = None, interval: int = None, count: int = 100) -> Optional[pd.DataFrame]:
         """Get historical candles from Deriv API"""
         try:
