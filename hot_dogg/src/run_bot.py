@@ -5,6 +5,7 @@ This module supervises the trading session by launching the monitor loop,
 tracking realised profit/loss, enforcing daily targets, and ensuring the bot
 shuts down gracefully when objectives or risk limits are reached.
 """
+# ruff: noqa: E402
 
 from __future__ import annotations
 

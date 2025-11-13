@@ -482,7 +482,16 @@ async def monitor():
     logger.info("🎯 Improvements: Signal Performance Tracking, Enhanced Analytics")
     logger.info("=" * 70)
     
-    data_source = DerivDataSource(symbol=MARKET)
+    data_source = DerivDataSource(
+        symbol=MARKET,
+        email_service=EmailService(
+            smtp_server=os.getenv("SMTP_SERVER", "smtp.gmail.com"),
+            smtp_port=int(os.getenv("SMTP_PORT", "587")),
+            username=os.getenv("EMAIL_USERNAME"),
+            password=os.getenv("EMAIL_PASSWORD"),
+        ),
+        alert_email=os.getenv("ALERT_EMAIL"),
+    )
     strategy = EnhancedZoneStrategy(logger)
     cycle_count = 0
     while not shutdown_event.is_set():

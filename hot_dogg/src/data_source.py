@@ -19,7 +19,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 class DerivDataSource:
-    def __init__(self, app_id=None, api_token=None, symbol: Optional[str] = None):
+    def __init__(
+        self,
+        app_id=None,
+        api_token=None,
+        symbol: Optional[str] = None,
+        email_service=None,
+        alert_email: Optional[str] = None,
+    ):
         self.app_id = app_id or DERIV_APP_ID
         self.api_token = api_token or DERIV_API_TOKEN
         self.symbol = symbol or MARKET_SYMBOL
@@ -38,6 +45,8 @@ class DerivDataSource:
         self.landing_company: Optional[str] = None
         self.is_virtual: Optional[bool] = None
         self._authorization_logged = False
+        self.email_service = email_service
+        self.alert_email = alert_email
 
     async def _send_ws_request(self, request_data, retries: int = 3, retry_delay: float = 0.5):
         """Send a request to the Deriv API using WebSockets"""
@@ -82,6 +91,14 @@ class DerivDataSource:
             self.landing_company or "unknown",
         )
         self._authorization_logged = True
+
+    async def send_email(self, subject: str, body: str) -> None:
+        if not self.email_service or not self.alert_email:
+            return
+        try:
+            await self.email_service.send_email(subject, body, self.alert_email)
+        except Exception as exc:
+            self.logger.error(f"Failed to send data source email: {exc}")
     async def get_candles(self, symbol: str = None, interval: int = None, count: int = 100) -> Optional[pd.DataFrame]:
         """Get historical candles from Deriv API"""
         try:

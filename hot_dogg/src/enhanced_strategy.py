@@ -840,10 +840,20 @@ class EnhancedZoneStrategy:
         if self.logger:
             self.logger.info(msg)
         if hasattr(data_source, 'send_email'):
-            data_source.send_email(
-                f"Trade Open: {signal['signal']}",
-                msg,
+            email_subject = f"Trade Open: {signal.get('signal')}"
+            email_body = (
+                f"{msg}\n"
+                f"Symbol: {signal.get('symbol', data_source.symbol)}\n"
+                f"Price: {signal.get('price')}\n"
+                f"Stop Loss: {signal.get('stop_loss')}\n"
+                f"Take Profit: {signal.get('take_profit')}\n"
+                f"Zone: {signal.get('zone_type')} ({signal.get('zone_strength')})\n"
+                f"Risk/Reward: {signal.get('risk_reward')}"
             )
+            coro = data_source.send_email(email_subject, email_body)
+            if asyncio.iscoroutine(coro):
+                task = asyncio.create_task(coro)
+                task.add_done_callback(lambda t: t.exception() if t.exception() else None)
         self.increment_signal_count()
 
     def _update_peak_profit(self, total: float, activation: float, trail_gap: float) -> None:
@@ -869,10 +879,13 @@ class EnhancedZoneStrategy:
 
     def _notify_profit_lock(self, data_source, total: float) -> None:
         if hasattr(data_source, 'send_email'):
-            data_source.send_email(
+            coro = data_source.send_email(
                 "Profit Secured",
                 f"Closed Basket at ${total:.2f}"
             )
+            if asyncio.iscoroutine(coro):
+                task = asyncio.create_task(coro)
+                task.add_done_callback(lambda t: t.exception() if t.exception() else None)
         self.highest_session_profit = 0.0
 
     def _structure_precheck(self, df: pd.DataFrame, swing_window: int) -> Optional[Dict[str, Any]]:
