@@ -90,8 +90,37 @@ EMAIL_MAX_LOSS_SUBJECT = os.getenv("EMAIL_MAX_LOSS_SUBJECT", "Daily Loss Limit R
 
 
 # --- Deriv API ------------------------------------------------------------- #
-DERIV_APP_ID = os.getenv("DERIV_APP_ID")
-DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
+DERIV_APP_ID_REAL = os.getenv("DERIV_APP_ID_REAL")
+DERIV_API_TOKEN_REAL = os.getenv("DERIV_API_TOKEN_REAL")
+DERIV_APP_ID_DEMO = os.getenv("DERIV_APP_ID_DEMO")
+DERIV_API_TOKEN_DEMO = os.getenv("DERIV_API_TOKEN_DEMO")
+DERIV_ACCOUNT_MODE = os.getenv("DERIV_ACCOUNT_MODE", "demo").strip().lower()
+
+
+def _resolve_credential(explicit: Optional[str], real_value: Optional[str], demo_value: Optional[str]) -> Optional[str]:
+    """
+    Resolve a credential based on explicit overrides, configured account mode, and fallbacks.
+    """
+    if explicit:
+        return explicit
+    if DERIV_ACCOUNT_MODE == "real":
+        return real_value or demo_value
+    if DERIV_ACCOUNT_MODE == "demo":
+        return demo_value or real_value
+    # Unknown mode, prefer explicit fallbacks in order demo -> real
+    return demo_value or real_value
+
+
+DERIV_APP_ID = _resolve_credential(
+    os.getenv("DERIV_APP_ID"),
+    DERIV_APP_ID_REAL,
+    DERIV_APP_ID_DEMO,
+)
+DERIV_API_TOKEN = _resolve_credential(
+    os.getenv("DERIV_API_TOKEN"),
+    DERIV_API_TOKEN_REAL,
+    DERIV_API_TOKEN_DEMO,
+)
 
 
 # --- Utility Data Classes -------------------------------------------------- #
@@ -146,6 +175,11 @@ __all__ = [
     "EMAIL_TRADE_CLOSE_SUBJECT",
     "EMAIL_TARGET_HIT_SUBJECT",
     "EMAIL_MAX_LOSS_SUBJECT",
+    "DERIV_ACCOUNT_MODE",
+    "DERIV_APP_ID_REAL",
+    "DERIV_API_TOKEN_REAL",
+    "DERIV_APP_ID_DEMO",
+    "DERIV_API_TOKEN_DEMO",
     "DERIV_APP_ID",
     "DERIV_API_TOKEN",
     "TIMEFRAMES",
