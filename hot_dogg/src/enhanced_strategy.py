@@ -728,14 +728,10 @@ class EnhancedZoneStrategy:
             return None
         return prop
 
-    async def _open_layers(self, api: DerivAPI, proposal_id: str, stake_per_layer: float) -> int:
-        opened = 0
-        for _ in range(LAYER_COUNT):
-            buy = await api.buy({"buy": proposal_id, "price": stake_per_layer + 10})
-            if 'buy' in buy:
-                opened += 1
-            await asyncio.sleep(LAYER_DELAY_SECONDS)
-        return opened
+    async def _open_layer(self, api: DerivAPI, proposal_id: str, stake_per_layer: float) -> Dict[str, Any]:
+        buy = await api.buy({"buy": proposal_id, "price": stake_per_layer + 10})
+        opened = 1 if 'buy' in buy else 0
+        return {'opened': opened, 'response': buy}
 
     def _extract_proposal_id(self, proposal: Dict[str, Any]) -> Optional[str]:
         if not proposal:
@@ -808,29 +804,44 @@ class EnhancedZoneStrategy:
         signal: Dict[str, Any],
         data_source,
     ) -> Optional[Dict[str, Any]]:
-        proposal = await self._request_proposal(
-            api,
-            stake_per_layer=context['stake_per_layer'],
-            contract=context['contract'],
-            symbol=context['symbol'],
-            tp_amt=context['take_profit'],
-            sl_amt=context['stop_loss'],
-        )
-        proposal_id = self._extract_proposal_id(proposal)
-        if not proposal_id:
-            self._log_error("Proposal response missing identifier; cannot open layers.")
-            return None
+        opened_layers = 0
+        failed_layers = 0
+        layer_results: List[Dict[str, Any]] = []
 
-        opened_layers = await self._open_layers(api, proposal_id, context['stake_per_layer'])
+        for layer_index in range(LAYER_COUNT):
+            proposal = await self._request_proposal(
+                api,
+                stake_per_layer=context['stake_per_layer'],
+                contract=context['contract'],
+                symbol=context['symbol'],
+                tp_amt=context['take_profit'],
+                sl_amt=context['stop_loss'],
+            )
+            proposal_id = self._extract_proposal_id(proposal)
+            if not proposal_id:
+                failed_layers += 1
+                self._log_error(f"Layer {layer_index + 1}: Proposal response missing identifier.")
+                await asyncio.sleep(LAYER_DELAY_SECONDS)
+                continue
+
+            buy_response = await self._open_layer(api, proposal_id, context['stake_per_layer'])
+            opened_layers += buy_response.get('opened', 0)
+            if buy_response.get('opened', 0) == 0:
+                failed_layers += 1
+            layer_results.append({'proposal_id': proposal_id, **buy_response})
+            await asyncio.sleep(LAYER_DELAY_SECONDS)
+
         self._handle_successful_layers(opened_layers, data_source, signal)
+
         return {
-            'proposal_id': proposal_id,
             'opened_layers': opened_layers,
+            'failed_layers': failed_layers,
             'stake_per_layer': context['stake_per_layer'],
             'take_profit': context['take_profit'],
             'stop_loss': context['stop_loss'],
             'contract_type': context['contract'],
             'symbol': context['symbol'],
+            'layer_results': layer_results,
         }
 
     def _handle_successful_layers(self, opened: int, data_source, signal: dict) -> None:
