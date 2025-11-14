@@ -797,6 +797,13 @@ class EnhancedZoneStrategy:
             with suppress(Exception):
                 await api.disconnect()
 
+    async def execute_signal(self, signal: dict, data_source) -> Optional[Dict[str, Any]]:
+        """Public helper to execute a validated signal."""
+        execution = await self._execute_trade(signal, data_source)
+        if execution:
+            signal['execution'] = execution
+        return execution
+
     async def _execute_layers(
         self,
         api: DerivAPI,
@@ -991,7 +998,29 @@ class EnhancedZoneStrategy:
         signal = self.check_entry(entry_df, filtered_zones, fibs, structure, trades_this_session, h4_trend, h1_trend)
 
         if signal:
-            return await self._process_signal(signal, entry_df, structure, h4_trend, h1_trend, data_source)
+            signal_id = uuid.uuid4().hex
+            signal['id'] = signal_id
+            quality = self.assess_signal_quality(signal, entry_df, structure, h4_trend, h1_trend)
+            self._enrich_signal_with_quality(signal, quality)
+            self.save_signal_features(signal_id, quality['features'])
+
+            if self.logger:
+                self.logger.debug(
+                    "Signal %s assessment -> score=%.3f tier=%s rr=%.3f zone_strength=%.3f",
+                    signal_id,
+                    quality['score'],
+                    quality['tier'],
+                    signal.get('risk_reward', 0.0),
+                    signal.get('zone_strength', 0.0),
+                )
+
+            if quality['score'] >= 0.7:
+                if self.logger:
+                    self.logger.info(f"✅ SIGNAL: {signal['signal']} (Score: {quality['score']})")
+                signal['ready_for_execution'] = True
+                return signal
+
+            self._log_rejected_signal(quality['score'])
         return None
 
     def _collect_zones_from_timeframes(self, data: Dict[str, pd.DataFrame]) -> List[dict]:
@@ -1021,55 +1050,12 @@ class EnhancedZoneStrategy:
             self.logger.debug("Total zones collected before filtering: %d", len(zones))
         return zones
 
-    async def _process_signal(
-        self,
-        signal: dict,
-        entry_df: pd.DataFrame,
-        structure: dict,
-        h4_trend: str,
-        h1_trend: str,
-        data_source,
-    ) -> Optional[dict]:
-        """Enrich signal with quality assessment and execute if score is sufficient."""
-        signal_id = uuid.uuid4().hex
-        signal['id'] = signal_id
-        
-        quality = self.assess_signal_quality(signal, entry_df, structure, h4_trend, h1_trend)
-        self._enrich_signal_with_quality(signal, quality)
-        self.save_signal_features(signal_id, quality['features'])
-
-        if self.logger:
-            self.logger.debug(
-                "Signal %s assessment -> score=%.3f tier=%s rr=%.3f zone_strength=%.3f",
-                signal_id,
-                quality['score'],
-                quality['tier'],
-                signal.get('risk_reward', 0.0),
-                signal.get('zone_strength', 0.0),
-            )
-
-        if quality['score'] >= 0.7:
-            return await self._execute_quality_signal(signal, data_source)
-        
-        self._log_rejected_signal(quality['score'])
-        return None
-
     def _enrich_signal_with_quality(self, signal: dict, quality: Dict[str, Any]) -> None:
         """Add quality metrics to signal dictionary."""
         signal['quality_reasoning'] = quality['reasoning']
         signal['quality_score'] = quality['score']
         signal['quality_tier'] = quality['tier']
         signal['features'] = quality['features']
-
-    async def _execute_quality_signal(self, signal: dict, data_source) -> dict:
-        """Execute a signal that passed quality threshold."""
-        if self.logger:
-            self.logger.info(f"✅ SIGNAL: {signal['signal']} (Score: {signal['quality_score']})")
-        
-        execution = await self._execute_trade(signal, data_source)
-        if execution:
-            signal['execution'] = execution
-        return signal
 
     def _log_rejected_signal(self, score: float) -> None:
         """Log signal rejection due to low quality score."""

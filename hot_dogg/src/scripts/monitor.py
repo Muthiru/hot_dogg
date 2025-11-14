@@ -357,7 +357,11 @@ def predict_ml_success(signal):
         return 0.70  # Default success probability on error
 
 
-async def handle_signal(signal_dict: dict) -> None:
+async def handle_signal(
+    signal_dict: dict,
+    strategy: EnhancedZoneStrategy,
+    data_source: DerivDataSource,
+) -> bool:
     logger.info(
         f"[{datetime.now()}] ✅ SIGNAL FOUND: {signal_dict['signal']} @ "
         f"{signal_dict['price']:.2f} (Score: {signal_dict.get('quality_score')})"
@@ -367,13 +371,23 @@ async def handle_signal(signal_dict: dict) -> None:
     if not is_unique:
         session_logger.log_signal(signal_dict, email_sent=False)
         logger.info("🔄 Signal blocked - within 15-minute interval or duplicate")
-        return
+        return False
+
+    if signal_dict.get("ready_for_execution"):
+        execution = await strategy.execute_signal(signal_dict, data_source)
+        if execution:
+            signal_dict['execution'] = execution
+    else:
+        logger.info("✅ Signal logged but not marked ready for execution; skipping trade.")
+        session_logger.log_signal(signal_dict, email_sent=False)
+        return False
 
     signal_tracker.record_signal(signal_dict)
     email_sent = await send_signal_email(signal_dict)
     session_logger.log_signal(signal_dict, email_sent=email_sent)
     if not email_sent:
         logger.info("📧 Signal generated but email filtered by smart deduplicator")
+    return True
 
 
 def _resolve_current_price(data_source, signal_dict: Optional[dict]) -> float:
@@ -428,7 +442,7 @@ async def run_analysis_cycle(
     session_logger.log_analysis()
 
     if signal_dict:
-        await handle_signal(signal_dict)
+        await handle_signal(signal_dict, strategy, data_source)
     else:
         logger.info("No valid signal this cycle.")
 
