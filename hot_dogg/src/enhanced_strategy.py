@@ -731,7 +731,8 @@ class EnhancedZoneStrategy:
     async def _open_layer(self, api: DerivAPI, proposal_id: str, stake_per_layer: float) -> Dict[str, Any]:
         buy = await api.buy({"buy": proposal_id, "price": stake_per_layer + 10})
         opened = 1 if 'buy' in buy else 0
-        return {'opened': opened, 'response': buy}
+        contract_id = buy.get('buy', {}).get('contract_id')
+        return {'opened': opened, 'contract_id': contract_id, 'response': buy}
 
     def _extract_proposal_id(self, proposal: Dict[str, Any]) -> Optional[str]:
         if not proposal:
@@ -767,7 +768,20 @@ class EnhancedZoneStrategy:
         if not context:
             return None
 
-        return await self._execute_with_api(app_id, api_token, context, signal, data_source)
+        execution = await self._execute_with_api(app_id, api_token, context, signal, data_source)
+        if execution:
+            contracts = [layer.get('contract_id') for layer in execution.get('layer_results', []) if layer.get('contract_id')]
+            if contracts:
+                task = asyncio.create_task(
+                    self._monitor_contracts(
+                        contracts,
+                        signal,
+                        execution,
+                        data_source,
+                    )
+                )
+                task.add_done_callback(lambda t: t.exception() if t.exception() else None)
+        return execution
 
     async def _safe_authorize(self, app_id: int, api_token: str) -> Optional[DerivAPI]:
         try:
@@ -797,12 +811,157 @@ class EnhancedZoneStrategy:
             with suppress(Exception):
                 await api.disconnect()
 
+    async def _monitor_contracts(
+        self,
+        contract_ids: List[str],
+        signal: dict,
+        execution: Dict[str, Any],
+        data_source,
+    ) -> None:
+        api_token, app_id = self._resolve_credentials(data_source)
+        api = await self._safe_authorize(app_id, api_token)
+        if not api:
+            return
+
+        start_balance = await self._fetch_balance(api)
+        remaining = set(contract_ids)
+        contract_details: Dict[str, Dict[str, Any]] = {}
+
+        try:
+            while remaining:
+                await self._poll_contract_status(api, remaining, contract_details)
+                if remaining:
+                    await asyncio.sleep(5)
+
+            end_balance = await self._fetch_balance(api)
+            await self._send_trade_summary_email(
+                signal,
+                execution,
+                contract_details,
+                start_balance,
+                end_balance,
+                data_source,
+            )
+        finally:
+            with suppress(Exception):
+                await api.disconnect()
+
+    async def _fetch_balance(self, api: DerivAPI) -> Optional[float]:
+        try:
+            balance_response = await api.balance()
+            return float(balance_response["balance"]["balance"])
+        except Exception as exc:
+            self._log_error(f"Balance fetch failed: {exc}")
+            return None
+
+    async def _poll_contract_status(
+        self,
+        api: DerivAPI,
+        remaining: set,
+        contract_details: Dict[str, Dict[str, Any]],
+    ) -> None:
+        for contract_id in tuple(remaining):
+            contract_info = await self._fetch_contract_info(api, contract_id)
+            if not contract_info:
+                continue
+            if contract_info.get("is_expired") or contract_info.get("is_sold"):
+                contract_details[contract_id] = contract_info
+                remaining.discard(contract_id)
+
+    async def _fetch_contract_info(self, api: DerivAPI, contract_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            poc = await api.proposal_open_contract(
+                {
+                    "proposal_open_contract": 1,
+                    "contract_id": contract_id,
+                }
+            )
+        except Exception as exc:
+            self._log_error(f"proposal_open_contract failed for {contract_id}: {exc}")
+            return None
+        return poc.get("proposal_open_contract")
+
+    async def _send_trade_summary_email(
+        self,
+        signal: dict,
+        execution: Dict[str, Any],
+        contract_details: Dict[str, Dict[str, Any]],
+        start_balance: Optional[float],
+        end_balance: Optional[float],
+        data_source,
+    ) -> None:
+        if not hasattr(data_source, "send_email"):
+            return
+
+        total_profit = 0.0
+        lines = []
+        for contract_id, info in contract_details.items():
+            profit = float(info.get("profit", 0.0))
+            total_profit += profit
+            sell_price = info.get("sell_price") or info.get("buy_price")
+            lines.append(
+                f"- Contract {contract_id}: profit={profit:.2f}, sell_price={sell_price}, entry={info.get('entry_tick_price')}"
+            )
+
+        lot_size = execution.get("stake_per_layer")
+        subject = f"Trade Closed: {signal.get('signal')} (P/L {total_profit:.2f})"
+        body = [
+            f"Symbol: {signal.get('symbol', execution.get('symbol'))}",
+            f"Direction: {signal.get('signal')}",
+            f"Lot size (stake per layer): {lot_size}",
+            f"Layers opened: {execution.get('opened_layers')}",
+            f"Total profit: {total_profit:.2f}",
+        ]
+        if start_balance is not None:
+            body.append(f"Starting balance: {start_balance:.2f}")
+        if end_balance is not None:
+            body.append(f"Ending balance: {end_balance:.2f}")
+        body.append("Closed contracts:")
+        body.extend(lines or ["- No contract details available"])
+
+        try:
+            await data_source.send_email(subject, "\n".join(body))
+        except Exception as exc:
+            self._log_error(f"Failed to send trade summary email: {exc}")
     async def execute_signal(self, signal: dict, data_source) -> Optional[Dict[str, Any]]:
         """Public helper to execute a validated signal."""
         execution = await self._execute_trade(signal, data_source)
         if execution:
             signal['execution'] = execution
         return execution
+
+    async def _request_layer_proposal(
+        self,
+        api: DerivAPI,
+        context: Dict[str, Any],
+        layer_index: int,
+    ) -> Optional[str]:
+        proposal = await self._request_proposal(
+            api,
+            stake_per_layer=context['stake_per_layer'],
+            contract=context['contract'],
+            symbol=context['symbol'],
+            tp_amt=context['take_profit'],
+            sl_amt=context['stop_loss'],
+        )
+        proposal_id = self._extract_proposal_id(proposal)
+        if not proposal_id:
+            self._log_error(f"Layer {layer_index + 1}: Proposal response missing identifier.")
+        return proposal_id
+
+    async def _perform_layer_execution(
+        self,
+        api: DerivAPI,
+        context: Dict[str, Any],
+        layer_index: int,
+    ) -> Dict[str, Any]:
+        proposal_id = await self._request_layer_proposal(api, context, layer_index)
+        if not proposal_id:
+            return {'opened': 0, 'error': 'missing_proposal'}
+
+        buy_response = await self._open_layer(api, proposal_id, context['stake_per_layer'])
+        buy_response['proposal_id'] = proposal_id
+        return buy_response
 
     async def _execute_layers(
         self,
@@ -811,32 +970,12 @@ class EnhancedZoneStrategy:
         signal: Dict[str, Any],
         data_source,
     ) -> Optional[Dict[str, Any]]:
-        opened_layers = 0
-        failed_layers = 0
-        layer_results: List[Dict[str, Any]] = []
-
-        for layer_index in range(LAYER_COUNT):
-            proposal = await self._request_proposal(
-                api,
-                stake_per_layer=context['stake_per_layer'],
-                contract=context['contract'],
-                symbol=context['symbol'],
-                tp_amt=context['take_profit'],
-                sl_amt=context['stop_loss'],
-            )
-            proposal_id = self._extract_proposal_id(proposal)
-            if not proposal_id:
-                failed_layers += 1
-                self._log_error(f"Layer {layer_index + 1}: Proposal response missing identifier.")
-                await asyncio.sleep(LAYER_DELAY_SECONDS)
-                continue
-
-            buy_response = await self._open_layer(api, proposal_id, context['stake_per_layer'])
-            opened_layers += buy_response.get('opened', 0)
-            if buy_response.get('opened', 0) == 0:
-                failed_layers += 1
-            layer_results.append({'proposal_id': proposal_id, **buy_response})
-            await asyncio.sleep(LAYER_DELAY_SECONDS)
+        layer_results = await self._execute_all_layer_attempts(api, context)
+        opened_layers = sum(result.get('opened', 0) for result in layer_results)
+        failed_layers = sum(1 for result in layer_results if result.get('opened', 0) == 0)
+        contract_ids = [
+            result['contract_id'] for result in layer_results if result.get('contract_id')
+        ]
 
         self._handle_successful_layers(opened_layers, data_source, signal)
 
@@ -849,7 +988,20 @@ class EnhancedZoneStrategy:
             'contract_type': context['contract'],
             'symbol': context['symbol'],
             'layer_results': layer_results,
+            'contract_ids': contract_ids,
         }
+
+    async def _execute_all_layer_attempts(
+        self,
+        api: DerivAPI,
+        context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for layer_index in range(LAYER_COUNT):
+            result = await self._perform_layer_execution(api, context, layer_index)
+            results.append(result)
+            await asyncio.sleep(LAYER_DELAY_SECONDS)
+        return results
 
     def _handle_successful_layers(self, opened: int, data_source, signal: dict) -> None:
         if opened <= 0:
