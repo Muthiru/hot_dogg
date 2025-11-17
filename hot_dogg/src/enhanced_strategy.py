@@ -526,12 +526,28 @@ class EnhancedZoneStrategy:
             window=lookback,
             min_periods=max(2, lookback // 2),
         ).mean()
+        
+        # Calculate zone validity period based on timeframe
+        tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 3600)
+        periods_valid = 48 if timeframe in ["1H", "4H"] else 24  # OB zones last longer
+        validity_seconds = periods_valid * tf_seconds
+        
         for i in range(lookback, len(working_df) - 1):
             prev = working_df.iloc[i - 1]
             curr = working_df.iloc[i]
             next_c = working_df.iloc[i + 1]
             block = self._identify_order_block(prev, curr, next_c, timeframe, avg_body.iloc[i])
             if block:
+                # Add timestamp information
+                zone_start = working_df.index[i - 1]  # When zone was detected (prev candle)
+                if isinstance(zone_start, pd.Timestamp):
+                    block['start_time'] = zone_start.isoformat()
+                    block['end_time'] = (zone_start + pd.Timedelta(seconds=validity_seconds)).isoformat()
+                else:
+                    # Fallback if index is not timestamp
+                    now = datetime.now(timezone.utc)
+                    block['start_time'] = now.isoformat()
+                    block['end_time'] = (now + pd.Timedelta(seconds=validity_seconds)).isoformat()
                 blocks.append(block)
         return blocks
 
@@ -541,12 +557,30 @@ class EnhancedZoneStrategy:
         timeframe: str,
     ) -> List[Dict[str, Any]]:
         fvgs: List[Dict[str, Any]] = []
+        
+        # Calculate zone validity period based on timeframe
+        tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 3600)
+        periods_valid = 24 if timeframe in ["1H", "4H"] else 12  # FVG zones last shorter
+        validity_seconds = periods_valid * tf_seconds
+        
         for i in range(len(df) - 2):
             c1 = df.iloc[i]
             c3 = df.iloc[i + 2]
             gap_size = (c3["low"] - c1["high"]) if c1["high"] < c3["low"] else (
                 c1["low"] - c3["high"]
             )
+            
+            # Get timestamp for when FVG was detected (c3 candle)
+            zone_start = df.index[i + 2]
+            if isinstance(zone_start, pd.Timestamp):
+                start_iso = zone_start.isoformat()
+                end_iso = (zone_start + pd.Timedelta(seconds=validity_seconds)).isoformat()
+            else:
+                # Fallback if index is not timestamp
+                now = datetime.now(timezone.utc)
+                start_iso = now.isoformat()
+                end_iso = (now + pd.Timedelta(seconds=validity_seconds)).isoformat()
+            
             if c1["high"] < c3["low"]:
                 fvgs.append(
                     {
@@ -556,6 +590,8 @@ class EnhancedZoneStrategy:
                         "high": c3["low"],
                         "timeframe": timeframe,
                         "strength": round(max(gap_size, 0.0), 5),
+                        "start_time": start_iso,
+                        "end_time": end_iso,
                     }
                 )
             elif c1["low"] > c3["high"]:
@@ -567,6 +603,8 @@ class EnhancedZoneStrategy:
                         "high": c1["low"],
                         "timeframe": timeframe,
                         "strength": round(max(gap_size, 0.0), 5),
+                        "start_time": start_iso,
+                        "end_time": end_iso,
                     }
                 )
         return fvgs
@@ -1256,7 +1294,7 @@ class EnhancedZoneStrategy:
             path = EXPORTS_DIR / 'adapted_zones.csv'
             with open(path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['type', 'low', 'high', 'timeframe', 'subtype', 'strength'])
+                writer.writerow(['type', 'low', 'high', 'timeframe', 'subtype', 'strength', 'start_time', 'end_time'])
                 for z in zones[:MAX_ZONE_EXPORTS]:
                     subtype = 'OB' if 'OB' in z['type'] else 'FVG'
                     market_side = 'supply' if 'Bearish' in z['type'] else 'demand'
@@ -1267,6 +1305,8 @@ class EnhancedZoneStrategy:
                         z.get('timeframe', '?'),
                         subtype,
                         z.get('strength', 0),
+                        z.get('start_time', ''),
+                        z.get('end_time', ''),
                     ])
         except Exception as exc:
             if self.logger:
