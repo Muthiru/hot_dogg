@@ -14,7 +14,6 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from dotenv import load_dotenv
@@ -71,22 +70,9 @@ os.environ["DERIV_ACCOUNT_MODE"] = ACCOUNT_MODE
 os.environ["DERIV_APP_ID"] = SELECTED_APP_ID
 os.environ["DERIV_API_TOKEN"] = SELECTED_TOKEN
 
-from config.settings import (  # noqa: E402  # pylint: disable=wrong-import-position
-    DAILY_TARGET,
-    DERIV_API_TOKEN,
-    DERIV_APP_ID,
-    EMAIL_MAX_LOSS_SUBJECT,
-    EMAIL_TARGET_HIT_SUBJECT,
-    BONUS_TARGET,
-    BONUS_MIN_RECENT_TRADES,
-    BONUS_MIN_AVG_SCORE,
-    BONUS_MIN_WIN_RATE,
-    MAX_DAILY_LOSS,
-    MAX_SESSION_DURATION,
-)
+from config.settings import DERIV_API_TOKEN, DERIV_APP_ID  # noqa: E402  # pylint: disable=wrong-import-position
 from deriv_api import DerivAPI
-from email_service import EmailService
-from scripts.monitor import monitor, request_shutdown, signal_tracker
+from scripts.monitor import monitor, request_shutdown
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -109,17 +95,7 @@ class SessionManager:
         self.login_id: Optional[str] = None
         self.landing_company: Optional[str] = None
         self._authorization_logged = False
-        self.start_time: datetime = datetime.now(timezone.utc)
         self.start_balance: Optional[float] = None
-        self.bonus_active = False
-        self.bonus_enabled = BONUS_TARGET > max(DAILY_TARGET, 0.0)
-        self.email_service = EmailService(
-            smtp_server=os.getenv("SMTP_SERVER", "smtp.gmail.com"),
-            smtp_port=int(os.getenv("SMTP_PORT", "587")),
-            username=os.getenv("EMAIL_USERNAME"),
-            password=os.getenv("EMAIL_PASSWORD"),
-        )
-        self.alert_email = os.getenv("ALERT_EMAIL")
 
     async def _get_balance(self) -> Optional[float]:
         api = DerivAPI(app_id=self.app_id)
@@ -161,15 +137,6 @@ class SessionManager:
             except Exception:
                 pass
 
-    async def _send_alert(self, subject: str, body: str) -> None:
-        if not self.alert_email:
-            logger.warning("Alert email not configured; skipping notification.")
-            return
-        try:
-            await self.email_service.send_email(subject, body, self.alert_email)
-        except Exception as exc:
-            logger.error(f"Failed to send session alert: {exc}")
-
     def _record_authorization(self, auth_response: Optional[dict]) -> None:
         if self._authorization_logged or not auth_response:
             return
@@ -199,106 +166,10 @@ class SessionManager:
         monitor_task = asyncio.create_task(monitor())
 
         try:
-            while not monitor_task.done():
-                await asyncio.sleep(60)
-                should_stop, reason = await self._evaluate_limits()
-                if should_stop:
-                    logger.info(f"Session limit reached: {reason}. Initiating shutdown.")
-                    request_shutdown()
-                    break
+            await monitor_task
         finally:
             await self._close_all_positions()
             await monitor_task
-
-    async def _evaluate_limits(self) -> Tuple[bool, str]:
-        now = datetime.now(timezone.utc)
-        elapsed = now - self.start_time
-        if elapsed >= MAX_SESSION_DURATION:
-            await self._send_alert(
-                subject="Session Timeout",
-                body=f"Trading session reached the maximum duration ({MAX_SESSION_DURATION}).",
-            )
-            return True, "time limit reached"
-
-        balance = await self._get_balance()
-        if balance is None:
-            return False, ""
-
-        profit = balance - self.start_balance
-        if profit >= DAILY_TARGET:
-            bonus_action = await self._handle_bonus_tier(profit)
-            if bonus_action == "continue":
-                return False, ""
-            if bonus_action == "bonus_hit":
-                return True, "bonus target achieved"
-            await self._send_alert(
-                subject=EMAIL_TARGET_HIT_SUBJECT,
-                body=f"Daily profit target reached: ${profit:.2f}. Bot shutting down.",
-            )
-            return True, "daily target achieved"
-
-        if profit <= MAX_DAILY_LOSS:
-            await self._send_alert(
-                subject=EMAIL_MAX_LOSS_SUBJECT,
-                body=f"Daily loss limit reached: ${profit:.2f}. Bot shutting down to protect capital.",
-            )
-            return True, "daily loss limit hit"
-
-        return False, ""
-
-    async def _handle_bonus_tier(self, profit: float) -> Optional[str]:
-        """
-        Evaluate and manage the bonus profit tier.
-
-        Returns:
-            Optional[str]:
-                "continue"   -> keep running towards bonus target,
-                "bonus_hit"  -> bonus target achieved, caller should shut down,
-                None         -> fall back to standard daily target handling.
-        """
-        if not self.bonus_enabled:
-            return None
-
-        if not signal_tracker:
-            return None
-
-        if self.bonus_active:
-            if BONUS_TARGET <= DAILY_TARGET or BONUS_TARGET <= 0:
-                return None
-            if profit >= BONUS_TARGET:
-                await self._send_alert(
-                    subject="Bonus Target Hit",
-                    body=f"Extended profit target reached: ${profit:.2f}. Bot shutting down.",
-                )
-                return "bonus_hit"
-            return "continue"  # Continue session towards bonus target.
-
-        performance = signal_tracker.recent_performance(BONUS_MIN_RECENT_TRADES)
-        required_trades = max(1, BONUS_MIN_RECENT_TRADES)
-        if performance["count"] < required_trades:
-            return None
-        if performance["average_score"] < BONUS_MIN_AVG_SCORE:
-            return None
-        if performance["win_rate"] < BONUS_MIN_WIN_RATE:
-            return None
-
-        self.bonus_active = True
-        logger.info(
-            "Bonus tier activated: extending profit cap to $%.2f "
-            "(avg score %.2f, win rate %.2f across %d trades).",
-            BONUS_TARGET,
-            performance["average_score"],
-            performance["win_rate"],
-            performance["count"],
-        )
-        await self._send_alert(
-            subject="Bonus Tier Activated",
-            body=(
-                "Recent performance met quality thresholds. Extending session "
-                f"target to ${BONUS_TARGET:.2f}. Current profit: ${profit:.2f}."
-            ),
-        )
-        return "continue"
 
 
 async def main() -> None:
